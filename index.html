@@ -56,28 +56,49 @@
   <script type="module">
     import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
     import { ARButton } from 'https://unpkg.com/three@0.150.1/examples/jsm/webxr/ARButton.js';
+    
+    // Error handling for WebXR
+    window.addEventListener('error', function(event) {
+      console.error('Global error:', event.error);
+      updateStatus('An error occurred. Please restart the application.');
+    });
+    
+    // Performance monitoring
+    let fpsDisplay = false;
+    if (fpsDisplay) {
+      (function(){
+        const script = document.createElement('script');
+        script.src = 'https://cdnjs.cloudflare.com/ajax/libs/stats.js/r17/Stats.min.js';
+        script.onload = function() {
+          const stats = new Stats();
+          document.body.appendChild(stats.dom);
+          requestAnimationFrame(function loop() {
+            stats.update();
+            requestAnimationFrame(loop);
+          });
+        };
+        document.head.appendChild(script);
+      })();
+    }
 
     // Main variables
     let camera, scene, renderer;
     let leftController, rightController;
     let selectedPhoto = null;
-    let interactionMode = 'none'; // 'none', 'move', 'resize'
+    let interactionMode = 'none'; // 'none', 'move', 'resize', 'rotate'
     let initialDistance = 0;
     let initialScale = new THREE.Vector3();
     let initialRotation = new THREE.Euler();
     let photos = [];
     let photoFrames = [];
     
-    // For cleanup
-    let controllerEventListeners = [];
-
     // Set up the photo gallery paths
     const photoURLs = [
-      './Photo/photo1.jpg',
-      './Photo/photo2.jpg',
-      './Photo/photo3.jpg',
-      './Photo/photo4.jpg',
-      './Photo/photo5.jpg',
+      './Photos/photo1.jpg',
+      './Photos/photo2.jpg',
+      './Photos/photo3.jpg',
+      './Photos/photo4.jpg',
+      './Photos/photo5.jpg',
     ];
     
     init();
@@ -165,63 +186,28 @@
     function onSessionEnd() {
       updateStatus('AR session ended');
       document.getElementById('start-button').style.display = 'block';
-      cleanupScene();
-    }
-
-    function cleanupScene() {
-      // Remove photos
-      photoFrames.forEach(frame => {
-        // Dispose textures/materials/geometries
-        const mesh = frame.userData.photoMesh;
-        if (mesh.material.map) mesh.material.map.dispose();
-        mesh.material.dispose();
-        mesh.geometry.dispose();
-        // Border frame
-        const border = frame.children.find(c => !c.userData.isPhotoMesh);
-        if (border) {
-          border.material.dispose();
-          border.geometry.dispose();
-        }
-        scene.remove(frame);
-      });
-      photoFrames = [];
-      photos = [];
-
-      // Remove controllers and their event listeners
-      [leftController, rightController].forEach(controller => {
-        if (!controller) return;
-        controllerEventListeners.forEach(({ target, type, listener }) => {
-          if (target === controller) {
-            controller.removeEventListener(type, listener);
-          }
-        });
-        scene.remove(controller);
-      });
-      controllerEventListeners = [];
-
-      // Stop rendering
-      renderer.setAnimationLoop(null);
     }
 
     function createPhotoGallery() {
       const textureLoader = new THREE.TextureLoader();
       
-      // Create a stack of photos offset slightly from each other
+      // Arrange photos in a circular pattern rather than a stack
+      // This helps prevent accidental multiple selections
       photoURLs.forEach((url, index) => {
         const aspectRatio = 4/3; // Default until image loads
-        const width = 0.3;
+        const width = 0.25; // Slightly smaller for better performance
         const height = width / aspectRatio;
         
-        // Photo mesh
+        // Create photo frame with placeholder material
         const photoGeometry = new THREE.PlaneGeometry(width, height);
         const placeholderMaterial = new THREE.MeshBasicMaterial({ 
           color: 0xcccccc,
           side: THREE.DoubleSide
         });
-        const photoFrame = new THREE.Mesh(photoGeometry, placeholderMaterial);
-        photoFrame.userData.isPhotoMesh = true;
         
-        // Border mesh
+        const photoFrame = new THREE.Mesh(photoGeometry, placeholderMaterial);
+        
+        // Create border frame
         const borderWidth = 0.01;
         const borderGeometry = new THREE.PlaneGeometry(width + borderWidth, height + borderWidth);
         const borderMaterial = new THREE.MeshStandardMaterial({
@@ -230,78 +216,131 @@
           roughness: 0.7,
           metalness: 0.3
         });
+        
         const borderFrame = new THREE.Mesh(borderGeometry, borderMaterial);
         borderFrame.position.z = -0.001; // Slightly behind photo
         
-        // Group
         const photoWithFrame = new THREE.Group();
         photoWithFrame.add(photoFrame);
         photoWithFrame.add(borderFrame);
-        photoWithFrame.position.set(0, 0, -0.5 - index * 0.05);
+        
+        // Position the photos in a semi-circle in front of the user
+        const radius = 0.8; // Radius of the circle
+        const totalAngle = Math.PI * 0.8; // How much of the circle to use
+        const angle = -totalAngle/2 + (index / (photoURLs.length-1)) * totalAngle;
+        
+        const x = radius * Math.sin(angle);
+        const z = -radius * Math.cos(angle);
+        
+        photoWithFrame.position.set(x, 0, z);
+        photoWithFrame.rotation.y = -angle; // Face the user
+        
         photoWithFrame.userData = {
           isPhoto: true,
           index: index,
           originalPosition: photoWithFrame.position.clone(),
-          interactable: true,
-          photoMesh: photoFrame
+          originalRotation: photoWithFrame.rotation.clone(),
+          interactable: true
         };
         
         photoFrames.push(photoWithFrame);
         scene.add(photoWithFrame);
         
-        // Load the actual photo texture
-        textureLoader.load(
-          url,
-          (texture) => {
-            const imgAspectRatio = texture.image.width / texture.image.height;
-            const correctedHeight = width / imgAspectRatio;
-            // Update geometry
-            photoFrame.geometry.dispose();
-            photoFrame.geometry = new THREE.PlaneGeometry(width, correctedHeight);
-            borderFrame.geometry.dispose();
-            borderFrame.geometry = new THREE.PlaneGeometry(width + borderWidth, correctedHeight + borderWidth);
-            // Update material
-            photoFrame.material.dispose();
-            photoFrame.material = new THREE.MeshBasicMaterial({
-              map: texture,
-              side: THREE.DoubleSide
-            });
-            // Store
-            photos.push({
-              mesh: photoWithFrame,
-              texture: texture,
-              aspectRatio: imgAspectRatio
-            });
-            updateStatus(`Photo ${index + 1}/${photoURLs.length} loaded`);
-            if (photos.length === photoURLs.length) {
-              updateStatus('All photos loaded. Use your hands to interact!');
+        // Add collision box for better interaction
+        const collisionGeometry = new THREE.BoxGeometry(width + 0.05, height + 0.05, 0.02);
+        const collisionMaterial = new THREE.MeshBasicMaterial({
+          transparent: true,
+          opacity: 0.0, // Invisible
+          side: THREE.DoubleSide
+        });
+        const collisionBox = new THREE.Mesh(collisionGeometry, collisionMaterial);
+        photoWithFrame.add(collisionBox);
+        
+        // Load the actual photo texture with error handling and retry
+        const loadTexture = (attempt = 0) => {
+          textureLoader.load(
+            url,
+            (texture) => {
+              try {
+                // Calculate proper aspect ratio from loaded texture
+                const imgAspectRatio = texture.image.width / texture.image.height;
+                const correctedHeight = width / imgAspectRatio;
+                
+                // Update geometry with correct aspect ratio
+                photoFrame.geometry.dispose();
+                photoFrame.geometry = new THREE.PlaneGeometry(width, correctedHeight);
+                borderFrame.geometry.dispose();
+                borderFrame.geometry = new THREE.PlaneGeometry(width + borderWidth, correctedHeight + borderWidth);
+                collisionBox.geometry.dispose();
+                collisionBox.geometry = new THREE.BoxGeometry(width + 0.05, correctedHeight + 0.05, 0.02);
+                
+                // Update material with loaded texture
+                photoFrame.material.dispose();
+                photoFrame.material = new THREE.MeshBasicMaterial({
+                  map: texture,
+                  side: THREE.DoubleSide
+                });
+                
+                // Store reference to photo with info
+                photos.push({
+                  mesh: photoWithFrame,
+                  texture: texture,
+                  aspectRatio: imgAspectRatio
+                });
+                
+                updateStatus(`Photo ${index + 1}/${photoURLs.length} loaded`);
+                
+                if (photos.length === photoURLs.length) {
+                  updateStatus('All photos loaded. Use your hands to interact!');
+                }
+              } catch (error) {
+                console.error('Error processing texture:', error);
+                if (attempt < 2) {
+                  console.log(`Retrying texture load for photo ${index + 1}, attempt ${attempt + 1}`);
+                  loadTexture(attempt + 1);
+                } else {
+                  updateStatus(`Error processing photo ${index + 1}`);
+                }
+              }
+            },
+            undefined,
+            (error) => {
+              console.error('Error loading texture:', error);
+              if (attempt < 2) {
+                console.log(`Retrying texture load for photo ${index + 1}, attempt ${attempt + 1}`);
+                loadTexture(attempt + 1);
+              } else {
+                updateStatus(`Error loading photo ${index + 1}`);
+              }
             }
-          },
-          undefined,
-          (error) => {
-            console.error('Error loading texture:', error);
-            updateStatus(`Error loading photo ${index + 1}`);
-          }
-        );
+          );
+        };
+        
+        loadTexture();
       });
     }
 
     function setupControllers(session) {
+      // Set up left and right hand controllers
       leftController = renderer.xr.getController(0);
       leftController.userData.name = 'left';
       scene.add(leftController);
+      
       rightController = renderer.xr.getController(1);
       rightController.userData.name = 'right';
       scene.add(rightController);
       
+      // Add visual hand models
       addHandVisual(leftController, 0x6699ff);
       addHandVisual(rightController, 0xff6666);
       
+      // Add hand tracking events
       addHandEvents(leftController);
       addHandEvents(rightController);
     }
     
     function addHandVisual(controller, color) {
+      // Simple sphere to represent hand position
       const handGeometry = new THREE.SphereGeometry(0.02, 16, 16);
       const handMaterial = new THREE.MeshStandardMaterial({
         color: color,
@@ -315,48 +354,78 @@
     }
     
     function addHandEvents(controller) {
-      const events = [
-        { type: 'selectstart', listener: onSelectStart },
-        { type: 'selectend',   listener: onSelectEnd },
-        { type: 'squeezestart', listener: onSqueezeStart },
-        { type: 'squeezeend',  listener: onSqueezeEnd },
-      ];
-      events.forEach(({type, listener}) => {
-        controller.addEventListener(type, listener);
-        controllerEventListeners.push({ target: controller, type, listener });
-      });
+      controller.addEventListener('selectstart', onSelectStart);
+      controller.addEventListener('selectend', onSelectEnd);
+      
+      // For pinch/grip detection
+      controller.addEventListener('squeezestart', onSqueezeStart);
+      controller.addEventListener('squeezeend', onSqueezeEnd);
     }
 
     function onSelectStart(event) {
+      // If we already have a selected photo, ignore new selections
+      if (selectedPhoto && interactionMode !== 'none') {
+        return;
+      }
+      
       const controller = event.target;
       const controllerPos = new THREE.Vector3();
       controller.getWorldPosition(controllerPos);
-      const intersectedPhoto = findIntersectedPhoto(controllerPos);
-      console.log('selectstart', { intersectedPhoto, interactionMode });
-      if (intersectedPhoto) {
-        selectedPhoto = intersectedPhoto;
-        interactionMode = 'move';
-        selectedPhoto.userData.interactable = false; // lock it
-        // highlight the photo mesh
-        const mesh = selectedPhoto.userData.photoMesh;
-        mesh.material.emissive = new THREE.Color(0x0066ff);
-        mesh.material.emissiveIntensity = 0.5;
-        // store offset
-        selectedPhoto.userData.offset = new THREE.Vector3().subVectors(
-          selectedPhoto.position,
-          controllerPos
-        );
-        updateStatus('Moving photo. Use both hands to resize or rotate.');
+      
+      try {
+        // Check if we're pointing at a photo
+        const intersectedPhoto = findIntersectedPhoto(controllerPos);
+        
+        if (intersectedPhoto) {
+          selectedPhoto = intersectedPhoto;
+          interactionMode = 'move';
+          
+          // Apply visual feedback to the border frame (second child)
+          if (selectedPhoto.children && selectedPhoto.children.length > 1) {
+            const borderFrame = selectedPhoto.children[1];
+            if (borderFrame.material) {
+              borderFrame.material.color.set(0x0066ff);
+              borderFrame.material.emissive = new THREE.Color(0x0066ff);
+              borderFrame.material.emissiveIntensity = 0.5;
+            }
+          }
+          
+          // Store initial position
+          selectedPhoto.userData.offset = new THREE.Vector3().subVectors(
+            selectedPhoto.position,
+            controllerPos
+          );
+          
+          // Store which controller selected this photo
+          selectedPhoto.userData.selectedBy = controller.userData.name;
+          
+          updateStatus('Moving photo. Use both hands to resize or rotate.');
+        }
+      } catch (error) {
+        console.error('Error in selection:', error);
+        // Reset state in case of error
+        selectedPhoto = null;
+        interactionMode = 'none';
       }
     }
     
-    function onSelectEnd() {
-      if (selectedPhoto && interactionMode === 'move') {
-        console.log('selectend', { selectedPhoto, interactionMode });
-        // reset highlight
-        const mesh = selectedPhoto.userData.photoMesh;
-        if (mesh.material.emissive) mesh.material.emissiveIntensity = 0;
-        selectedPhoto.userData.interactable = true; // unlock
+    function onSelectEnd(event) {
+      const controller = event.target;
+      
+      // Only process if this is the controller that selected the photo
+      if (selectedPhoto && 
+          interactionMode === 'move' && 
+          selectedPhoto.userData.selectedBy === controller.userData.name) {
+        
+        // Reset visual feedback on the border frame
+        if (selectedPhoto.children && selectedPhoto.children.length > 1) {
+          const borderFrame = selectedPhoto.children[1];
+          if (borderFrame.material) {
+            borderFrame.material.color.set(0xffffff);
+            borderFrame.material.emissiveIntensity = 0;
+          }
+        }
+        
         selectedPhoto = null;
         interactionMode = 'none';
         updateStatus('Photo placed. Select again to move.');
@@ -366,13 +435,36 @@
     function onSqueezeStart(event) {
       const controller = event.target;
       controller.userData.squeezing = true;
-      console.log('squeezestart', { left: leftController.userData.squeezing, right: rightController.userData.squeezing, interactionMode });
-      if (selectedPhoto && interactionMode === 'move' &&
+      
+      // Safety check - prevent entering resize mode if we're already in it
+      if (interactionMode === 'resize') {
+        return;
+      }
+      
+      // Check if both hands are now squeezing and we have a selected photo
+      if (selectedPhoto && interactionMode === 'move' && 
           leftController.userData.squeezing && rightController.userData.squeezing) {
+        
+        // Prevent entering resize mode if controllers are too far apart
+        const distance = getControllerDistance();
+        if (distance > 0.5) { // More than 50cm apart is probably not intentional
+          updateStatus('Hands too far apart for resize mode');
+          return;
+        }
+        
         interactionMode = 'resize';
-        initialDistance = getControllerDistance();
+        
+        // Store initial data for resize/rotate operation
+        initialDistance = distance;
         initialScale.copy(selectedPhoto.scale);
         initialRotation.copy(selectedPhoto.rotation);
+        
+        // Store current controller positions
+        selectedPhoto.userData.lastLeftPos = new THREE.Vector3();
+        selectedPhoto.userData.lastRightPos = new THREE.Vector3();
+        leftController.getWorldPosition(selectedPhoto.userData.lastLeftPos);
+        rightController.getWorldPosition(selectedPhoto.userData.lastRightPos);
+        
         updateStatus('Resizing/rotating photo. Move hands apart to resize, twist to rotate.');
       }
     }
@@ -380,75 +472,244 @@
     function onSqueezeEnd(event) {
       const controller = event.target;
       controller.userData.squeezing = false;
-      console.log('squeezeend', { left: leftController.userData.squeezing, right: rightController.userData.squeezing, interactionMode });
+      
+      // If we're in resize mode but one of the controllers released
       if (interactionMode === 'resize') {
-        interactionMode = 'move';
-        updateStatus('Resize complete. Still moving photo.');
+        // Check if both hands are released
+        if (!leftController.userData.squeezing && !rightController.userData.squeezing) {
+          // Complete reset - go back to no interaction
+          if (selectedPhoto) {
+            // Reset visual feedback
+            if (selectedPhoto.children && selectedPhoto.children.length > 1) {
+              const borderFrame = selectedPhoto.children[1];
+              if (borderFrame.material) {
+                borderFrame.material.color.set(0xffffff);
+                borderFrame.material.emissiveIntensity = 0;
+              }
+            }
+          }
+          
+          selectedPhoto = null;
+          interactionMode = 'none';
+          updateStatus('Photo placed. Select again to move.');
+        } else {
+          // Just one controller released, go back to move mode
+          interactionMode = 'move';
+          // Update which controller is now handling the move
+          if (selectedPhoto) {
+            selectedPhoto.userData.selectedBy = leftController.userData.squeezing ? 'left' : 'right';
+          }
+          updateStatus('Resize complete. Still moving photo.');
+        }
       }
     }
     
     function getControllerDistance() {
       const leftPos = new THREE.Vector3();
       const rightPos = new THREE.Vector3();
+      
       leftController.getWorldPosition(leftPos);
       rightController.getWorldPosition(rightPos);
+      
       return leftPos.distanceTo(rightPos);
     }
     
     function findIntersectedPhoto(controllerPos) {
+      // Improved proximity check for photos with raycast
       let closestPhoto = null;
-      let closestDistance = 0.2;
+      let closestDistance = 0.2; // Max interaction distance
+      
+      // Use raycasting for more precise hit detection
+      const raycaster = new THREE.Raycaster();
+      const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      raycaster.set(controllerPos, direction);
+      
+      // Collect all photo meshes for raycasting
+      const photoMeshes = photoFrames.map(frame => {
+        // Get the first child which is the actual photo plane
+        const photoMesh = frame.children[0];
+        photoMesh.userData.parentFrame = frame; // Store reference to parent
+        return photoMesh;
+      });
+      
+      const intersects = raycaster.intersectObjects(photoMeshes);
+      
+      // If we got intersections, use the closest one
+      if (intersects.length > 0) {
+        const intersection = intersects[0];
+        if (intersection.distance < closestDistance) {
+          // Return the parent frame which has all our userData
+          closestPhoto = intersection.object.userData.parentFrame;
+          return closestPhoto;
+        }
+      }
+      
+      // Fallback to simple distance check if raycasting doesn't hit
       photoFrames.forEach(photoFrame => {
-        if (!photoFrame.userData.interactable) return;
-        const d = controllerPos.distanceTo(photoFrame.position);
-        if (d < closestDistance) {
-          closestDistance = d;
+        const distance = controllerPos.distanceTo(photoFrame.position);
+        
+        if (distance < closestDistance) {
+          closestDistance = distance;
           closestPhoto = photoFrame;
         }
       });
+      
       return closestPhoto;
     }
 
     function handlePhotoInteraction(frame) {
       if (!selectedPhoto) return;
+      
       try {
         const leftPos = new THREE.Vector3();
         const rightPos = new THREE.Vector3();
-        leftController.getWorldPosition(leftPos);
-        rightController.getWorldPosition(rightPos);
-
+        
+        if (leftController && rightController) {
+          leftController.getWorldPosition(leftPos);
+          rightController.getWorldPosition(rightPos);
+        }
+        
+        // Handle move interaction
         if (interactionMode === 'move') {
-          const activeController = leftController.userData.squeezing ? leftController : rightController;
           const controllerPos = new THREE.Vector3();
+          
+          // Use the specific controller that initiated the selection
+          const activeController = selectedPhoto.userData.selectedBy === 'left' ? 
+                                  leftController : rightController;
+          
+          if (!activeController) return;
+          
           activeController.getWorldPosition(controllerPos);
-          selectedPhoto.position.copy(controllerPos).add(selectedPhoto.userData.offset);
-        } else if (interactionMode === 'resize') {
+          
+          // Check if the controller moved too far/fast (could indicate tracking issue)
+          if (selectedPhoto.userData.lastControllerPos) {
+            const deltaMove = controllerPos.distanceTo(selectedPhoto.userData.lastControllerPos);
+            if (deltaMove > 0.1) { // More than 10cm in one frame is suspicious
+              // Limit movement to prevent jumps
+              const direction = new THREE.Vector3().subVectors(
+                controllerPos, 
+                selectedPhoto.userData.lastControllerPos
+              ).normalize().multiplyScalar(0.1);
+              
+              controllerPos.copy(selectedPhoto.userData.lastControllerPos).add(direction);
+            }
+          }
+          
+          // Store current position for next frame
+          selectedPhoto.userData.lastControllerPos = controllerPos.clone();
+          
+          // Update position based on controller movement with the saved offset
+          if (selectedPhoto.userData.offset) {
+            selectedPhoto.position.copy(controllerPos).add(selectedPhoto.userData.offset);
+          }
+        }
+        
+        // Handle resize and rotation
+        else if (interactionMode === 'resize') {
+          // Calculate current distance between controllers
           const currentDistance = getControllerDistance();
-          const scaleFactor = currentDistance / initialDistance;
+          
+          // Scale photo based on change in distance, with limits
+          let scaleFactor = currentDistance / initialDistance;
+          
+          // Limit scale factor to reasonable ranges
+          scaleFactor = Math.max(0.5, Math.min(scaleFactor, 3.0));
+          
           selectedPhoto.scale.copy(initialScale).multiplyScalar(scaleFactor);
+          
+          // Calculate rotation based on controller orientation
           const controllerVector = new THREE.Vector3().subVectors(rightPos, leftPos);
           const angle = Math.atan2(controllerVector.x, controllerVector.z);
-          selectedPhoto.rotation.y = initialRotation.y + (angle - initialRotation.y);
+          
+          // Apply rotation to the Y axis (rotate around vertical axis)
+          // Smooth the rotation change
+          const currentRotation = selectedPhoto.rotation.y;
+          const targetRotation = initialRotation.y + (angle - initialRotation.y);
+          const smoothedRotation = currentRotation + (targetRotation - currentRotation) * 0.1;
+          selectedPhoto.rotation.y = smoothedRotation;
         }
-      } catch (e) {
-        console.error('Interaction error:', e);
+      } catch (error) {
+        console.error('Error in photo interaction:', error);
+        // Reset state in case of error
+        selectedPhoto = null;
+        interactionMode = 'none';
       }
     }
 
-    let lastRotateTime = 0;
+    // Frame rate monitoring
+    let lastTimestamp = 0;
+    let frameRates = [];
+    let lowFrameRateCount = 0;
+    
     function render(timestamp, frame) {
-      if (frame) {
-        handlePhotoInteraction(frame);
-        // subtle rotation on non-selected photos, throttled
-        if (timestamp - lastRotateTime > 50) {
-          photoFrames.forEach(photoFrame => {
-            if (photoFrame !== selectedPhoto) {
-              photoFrame.rotation.y += 0.001;
+      // Monitor frame rate for potential issues
+      if (lastTimestamp > 0) {
+        const frameTime = timestamp - lastTimestamp;
+        const fps = 1000 / frameTime;
+        
+        // Keep last 30 frames for monitoring
+        frameRates.push(fps);
+        if (frameRates.length > 30) frameRates.shift();
+        
+        // Check for consistently low frame rates
+        if (fps < 30) {
+          lowFrameRateCount++;
+          
+          // If we have low frame rates for several consecutive frames
+          if (lowFrameRateCount > 10) {
+            // Reset interactions to help recover
+            if (selectedPhoto) {
+              // Reset visual feedback
+              if (selectedPhoto.children && selectedPhoto.children.length > 1) {
+                const borderFrame = selectedPhoto.children[1];
+                if (borderFrame.material) {
+                  borderFrame.material.color.set(0xffffff);
+                  borderFrame.material.emissiveIntensity = 0;
+                }
+              }
+              
+              selectedPhoto = null;
+              interactionMode = 'none';
+              updateStatus('Performance issue detected - interaction reset');
+              
+              // Reset the counter
+              lowFrameRateCount = 0;
             }
-          });
-          lastRotateTime = timestamp;
+          }
+        } else {
+          // Reset counter when frame rate is good
+          lowFrameRateCount = 0;
         }
       }
+      lastTimestamp = timestamp;
+      
+      if (frame) {
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+        
+        try {
+          // Handle photo interactions
+          if (selectedPhoto) handlePhotoInteraction(frame);
+          
+          // Add subtle animation to non-selected photos
+          // Limit animations when we have performance issues
+          if (frameRates.length === 0 || 
+              frameRates.reduce((a, b) => a + b, 0) / frameRates.length > 40) {
+            photoFrames.forEach(photoFrame => {
+              if (photoFrame !== selectedPhoto) {
+                photoFrame.rotation.y += 0.0005; // Reduced animation speed
+              }
+            });
+          }
+        } catch (error) {
+          console.error('Error in render loop:', error);
+          // Reset state in case of error
+          selectedPhoto = null;
+          interactionMode = 'none';
+        }
+      }
+      
+      // Always render, even if there was an error in the logic
       renderer.render(scene, camera);
     }
   </script>
